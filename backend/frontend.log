@@ -1,0 +1,8 @@
+
+> backend@1.0.0 start
+> node server.js
+
+AI Dashboard Server running on http://localhost:5001
+Connected to the SQLite database.
+⚠️ Warning: AI Model not found at /Users/chitteshdharshan/Desktop/web/Project/water testing /backend/models/water_quality_model.onnx
+Falling back to rule-based classification.
