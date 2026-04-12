@@ -2,11 +2,9 @@ const express = require('express');
 const https = require('https');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const db = require('./database');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const db = require('./database');
-const path = require('path');
-const ort = require('onnxruntime-node');
 
 const app = express();
 const PORT = 5001;
@@ -15,20 +13,7 @@ const SECRET_KEY = 'water_testing_secret_key';
 app.use(cors());
 app.use(bodyParser.json());
 
-// ─── ONNX Model ─────────────────────────────────────────────
-const MODEL_PATH = path.join(__dirname, 'model.onnx');
-let session = null;
-async function initModel() {
-    try {
-        session = await ort.InferenceSession.create(MODEL_PATH);
-        console.log('✅ AI Model Loaded (model.onnx)');
-    } catch (err) {
-        console.warn('⚠️ model.onnx missing. Using rule-based fallback.');
-    }
-}
-initModel();
-
-// ─── Auth Middleware ─────────────────────────────────────────
+// ─── AUTH MIDDLEWARE ──────────────────────────────────────────
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -40,226 +25,28 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-const checkRole = (role) => (req, res, next) => {
-    if (req.user.role !== role && req.user.role !== 'admin') {
-        return res.status(403).json({ error: 'Access Denied: Insufficient Permissions' });
-    }
-    next();
-};
-
-// ─── METADATA (tanks + areas for dropdowns and mapping) ─────
-app.get('/api/metadata', (req, res) => {
-    db.all("SELECT * FROM tanks ORDER BY name", (err, tanks) => {
-        if (err) return res.status(500).json({ error: err.message });
-        db.all("SELECT a.*, t.name as tank_name FROM areas a JOIN tanks t ON a.tank_id = t.id ORDER BY a.name", (err, areas) => {
-            if (err) return res.status(500).json({ error: err.message });
-            db.all("SELECT DISTINCT district_en FROM tn_villages ORDER BY district_en", (err, districts) => {
-                res.json({ tanks, areas, districts: districts.map(d => d.district_en) });
-            });
-        });
-    });
-});
-
-// Get all unique districts
-app.get('/api/public/districts', (req, res) => {
-    db.all("SELECT DISTINCT district_en FROM tn_villages ORDER BY district_en", (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows.map(r => r.district_en));
-    });
-});
-
-// Get villages for a district
-app.get('/api/public/villages', (req, res) => {
-    const { district, q } = req.query;
-    if (!district) return res.status(400).json({ error: 'District is required' });
-
-    // We fetch only major urban areas from the manual 'areas' table
-    const query = `
-        SELECT TRIM(name) as name_en, '' as name_ta, 'City' as type, '' as taluk_en 
-        FROM areas 
-        WHERE district = ? ${q ? 'AND name LIKE ?' : ''}
-        ORDER BY name_en ASC LIMIT 50
-    `;
-
-    const params = q ? [district, `%${q}%`] : [district];
-
-    db.all(query, params, (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
-});
-
-// ─── PUBLIC ROUTES ────────────────────────────────────────────
-
-// All areas — returned WITH latest prediction for on-load map visualization
-app.get('/api/public/all-areas', (req, res) => {
-    const query = `
-        SELECT 
-            a.id as area_id,
-            a.name as area_name,
-            a.latitude,
-            a.longitude,
-            t.id as tank_id,
-            t.name as tank_name,
-            (SELECT prediction FROM water_readings wr WHERE wr.tank_id = t.id ORDER BY wr.created_at DESC LIMIT 1) as prediction,
-            (SELECT created_at FROM water_readings wr WHERE wr.tank_id = t.id ORDER BY wr.created_at DESC LIMIT 1) as created_at
-        FROM areas a
-        JOIN tanks t ON a.tank_id = t.id
-        ORDER BY a.name
-    `;
-    db.all(query, (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
-});
-
-// History for a specific area (via its tank)
-app.get('/api/public/area/:area_id', (req, res) => {
-    const query = `
-        SELECT wr.*, t.name as tank_name, a.name as area_name
-        FROM water_readings wr
-        JOIN areas a ON a.id = ?
-        JOIN tanks t ON t.id = a.tank_id
-        WHERE wr.tank_id = a.tank_id
-        ORDER BY wr.created_at DESC LIMIT 10
-    `;
-    db.all(query, [req.params.area_id], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
-});
-
-// City-level stats for chart
-app.get('/api/public/city-stats', (req, res) => {
-    const query = `
-        SELECT t.name as location,
-        COUNT(*) as total,
-        SUM(CASE WHEN wr.prediction='Unsafe' THEN 1 ELSE 0 END) as unsafe
-        FROM water_readings wr
-        JOIN tanks t ON t.id = wr.tank_id
-        GROUP BY t.id
-    `;
-    db.all(query, (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        const stats = rows.map(r => ({
-            ...r,
-            status: r.unsafe / r.total >= 0.3 ? 'Risky' : 'Safe'
-        }));
-        res.json(stats);
-    });
-});
-
-// ─── OFFICIAL ROUTES ──────────────────────────────────────────
-
+// ─── ADMIN ROUTES ──────────────────────────────────────────────
 app.post('/api/admin/login', (req, res) => {
     const { username, password } = req.body;
     db.get("SELECT * FROM users WHERE username = ?", [username], (err, user) => {
         if (err || !user || !bcrypt.compareSync(password, user.password)) {
             return res.status(401).json({ error: 'Auth Failed' });
         }
-        const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET_KEY, { expiresIn: '8h' });
-        res.json({ token, username, role: user.role });
+        const token = jwt.sign({ 
+            id: user.id, 
+            username: user.username, 
+            role: user.role,
+            district_id: user.district_id 
+        }, SECRET_KEY, { expiresIn: '8h' });
+        res.json({ token, username, role: user.role, district_id: user.district_id });
     });
 });
 
-// Add reading — official selects AREA + TEST DATE, backend finds TANK
-app.post('/api/official/add-reading', authenticateToken, checkRole('operator'), async (req, res) => {
-    const { area_id, test_date, ph, hardness, solids, chloramines, sulfate, conductivity, organic_carbon, trihalomethanes, turbidity } = req.body;
-
-    if (!area_id || [ph, hardness, solids, chloramines, sulfate, conductivity, organic_carbon, trihalomethanes, turbidity].some(v => v === undefined || v === null)) {
-        return res.status(400).json({ error: 'Missing required fields.' });
-    }
-    // Use provided date or today
-    const readingDate = test_date || new Date().toISOString().split('T')[0];
-
-    // Step 1: Resolve area → tank
-    db.get("SELECT a.*, t.name as tank_name FROM areas a JOIN tanks t ON t.id = a.tank_id WHERE a.id = ?", [area_id], async (err, area) => {
-        if (err || !area) return res.status(400).json({ error: 'Invalid area_id.' });
-
-        const tank_id = area.tank_id;
-
-        // Step 2: Run ONNX AI on tank parameters
-        let prediction = 'Safe';
-        if (session) {
-            try {
-                const inputData = new Float32Array([ph, hardness, solids, chloramines, sulfate, conductivity, organic_carbon, trihalomethanes, turbidity]);
-                const tensor = new ort.Tensor('float32', inputData, [1, 9]);
-                const results = await session.run({ float_input: tensor });
-                prediction = results.label.data[0] === 1 ? 'Safe' : 'Unsafe';
-            } catch (err) {
-                console.error('AI Prediction Error:', err);
-                if (ph < 6.5 || ph > 8.5 || solids > 500) prediction = 'Unsafe';
-            }
-        } else {
-            if (ph < 6.5 || ph > 8.5 || solids > 500) prediction = 'Unsafe';
-        }
-
-        // Borderline "Contaminated" check
-        if (prediction === 'Safe' && (ph < 6.8 || ph > 8.2 || solids > 400 || turbidity > 4)) {
-            prediction = 'Contaminated';
-        }
-
-        // Step 3: Store reading for TANK (with test_date)
-        const insertQuery = `INSERT INTO water_readings 
-            (tank_id, date, ph, hardness, solids, chloramines, sulfate, conductivity, organic_carbon, trihalomethanes, turbidity, prediction) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-
-        db.run(insertQuery, [tank_id, readingDate, ph, hardness, solids, chloramines, sulfate, conductivity, organic_carbon, trihalomethanes, turbidity, prediction], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-
-            const readingId = this.lastID;
-
-            // Step 4: Agent alert logic on TANK history
-            db.all(`SELECT * FROM water_readings WHERE tank_id = ? ORDER BY created_at DESC LIMIT 3`, [tank_id], (err, last3) => {
-                if (err) return console.error('Agent Logic Error:', err);
-
-                const unsafeCount = last3.filter(r => r.prediction === 'Unsafe').length;
-                if (unsafeCount >= 2) {
-                    db.run(`INSERT INTO alerts (tank_id, message, severity) VALUES (?, ?, ?)`,
-                        [tank_id, `Unsafe trend detected for ${area.tank_name} (2 out of 3 recent tests failed).`, 'High']);
-                }
-
-                if (ph < 6.5 || ph > 8.5) {
-                    db.run(`INSERT INTO alerts (tank_id, message, severity) VALUES (?, ?, ?)`,
-                        [tank_id, `Critical pH level detected at ${area.tank_name}: ${ph}. Safe range is 6.5–8.5.`, 'High']);
-                }
-
-                if (last3.length > 1) {
-                    const prevTurbidity = last3[1].turbidity;
-                    if (prevTurbidity > 0) {
-                        const increase = (turbidity - prevTurbidity) / prevTurbidity;
-                        if (increase > 0.5) {
-                            db.run(`INSERT INTO alerts (tank_id, message, severity) VALUES (?, ?, ?)`,
-                                [tank_id, `Sudden turbidity spike at ${area.tank_name}! Increase of ${Math.round(increase * 100)}% observed.`, 'Medium']);
-                        }
-                    }
-                }
-            });
-
-            // Step 5: Find all areas that share this tank (for affected areas display)
-            db.all("SELECT name FROM areas WHERE tank_id = ?", [tank_id], (err, affectedAreas) => {
-                const affectedNames = (affectedAreas || []).map(a => a.name);
-                res.status(201).json({
-                    id: readingId,
-                    prediction,
-                    tank_name: area.tank_name,
-                    area_name: area.name,
-                    affected_areas: affectedNames
-                });
-            });
-        });
-    });
-});
-
-// Alerts — enriched with tank name and affected areas
 app.get('/api/official/alerts', authenticateToken, (req, res) => {
     const query = `
-        SELECT al.*, t.name as tank_name,
-            GROUP_CONCAT(a.name, ', ') as affected_areas
+        SELECT al.*, t.name as tank_name
         FROM alerts al
-        JOIN tanks t ON t.id = al.tank_id
-        LEFT JOIN areas a ON a.tank_id = al.tank_id
-        GROUP BY al.id
+        JOIN water_tanks t ON t.id = al.tank_id
         ORDER BY al.created_at DESC LIMIT 50
     `;
     db.all(query, (err, rows) => {
@@ -268,16 +55,99 @@ app.get('/api/official/alerts', authenticateToken, (req, res) => {
     });
 });
 
-// Trend data per tank (for charts)
-app.get('/api/public/trends/:tank_id', (req, res) => {
-    const query = `SELECT * FROM water_readings WHERE tank_id = ? ORDER BY created_at DESC LIMIT 7`;
-    db.all(query, [req.params.tank_id], (err, rows) => {
+app.post('/api/official/add-water-data', authenticateToken, (req, res) => {
+    const { tank_id, date, ph, hardness, solids, chloramines, sulfate, conductivity, organic_carbon, trihalomethanes, turbidity } = req.body;
+    
+    if (!tank_id) return res.status(400).json({ error: 'Missing tank_id.' });
+
+    // AI DECISION ENGINE logic
+    let status = (ph < 6.5 || turbidity > 5) ? 'Unsafe' : 'Safe';
+    const testDate = date || new Date().toISOString().split('T')[0];
+
+    const sql = `INSERT INTO water_quality 
+        (tank_id, date, ph, hardness, solids, chloramines, sulfate, conductivity, organic_carbon, trihalomethanes, turbidity, status) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    
+    const params = [
+        tank_id, testDate, ph, hardness, solids, chloramines, sulfate, 
+        conductivity, organic_carbon, trihalomethanes, turbidity, status
+    ];
+
+    db.run(sql, params, function(err) {
         if (err) return res.status(500).json({ error: err.message });
-        res.json(rows.reverse());
+        
+        // Fetch names for frontend display enrichment
+        db.get(`
+            SELECT t.name as tank_name, a.name as area_name 
+            FROM water_tanks t 
+            JOIN areas a ON t.area_id = a.id 
+            WHERE t.id = ?`, [tank_id], (err, names) => {
+            
+            res.json({ 
+                success: true, 
+                status, 
+                prediction: status, // mapped for frontend compatibility
+                tank_name: names?.tank_name || 'N/A',
+                area_name: names?.area_name || 'N/A',
+                message: `Data logged successfully. AI Status: ${status}`,
+                id: this.lastID 
+            });
+        });
     });
 });
 
-// ─── HAVERSINE DISTANCE (km) ─────────────────────────────────
+// CSV UPLOAD (Assuming multer is used in production. For now, we take JSON arrays for demo compatibility)
+app.post('/api/official/upload-data', authenticateToken, (req, res) => {
+    const { data } = req.body; // Expecting an array of objects
+    if (!Array.isArray(data)) return res.status(400).json({ error: 'Invalid data format. Expected array.' });
+
+    const stmt = db.prepare(`INSERT INTO water_quality 
+        (tank_id, date, ph, hardness, solids, chloramines, sulfate, conductivity, organic_carbon, trihalomethanes, turbidity, status) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+
+    data.forEach(row => {
+        let status = (row.ph < 6.5 || row.turbidity > 5) ? 'Unsafe' : 'Safe';
+        stmt.run([
+            row.tank_id, row.date || new Date().toISOString().split('T')[0],
+            row.ph, row.hardness, row.solids, row.chloramines, row.sulfate,
+            row.conductivity, row.organic_carbon, row.trihalomethanes, row.turbidity, status
+        ]);
+    });
+
+    stmt.finalize();
+    res.json({ success: true, message: `Successfully imported ${data.length} records.` });
+});
+
+// ─── DROPDOWN UI Endpoints ─────────────────────────────────────
+app.get('/api/public/districts', (req, res) => {
+    db.all("SELECT id, name FROM districts ORDER BY name", (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+app.get('/api/public/taluks/:district_id', (req, res) => {
+    db.all("SELECT id, name FROM taluks WHERE district_id = ? ORDER BY name", [req.params.district_id], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+app.get('/api/public/areas/:taluk_id', (req, res) => {
+    db.all("SELECT id, name, latitude, longitude FROM areas WHERE taluk_id = ? ORDER BY name", [req.params.taluk_id], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+app.get('/api/public/tanks/:area_id', (req, res) => {
+    db.all("SELECT id, name, latitude, longitude, type FROM water_tanks WHERE area_id = ? ORDER BY name", [req.params.area_id], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// ─── SMART MAPPING & AGENTIC AI ────────────────────────────────
 function haversine(lat1, lon1, lat2, lon2) {
     const R = 6371;
     const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -287,162 +157,199 @@ function haversine(lat1, lon1, lat2, lon2) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// ─── GEOCODE HELPER WITH 3-LEVEL FALLBACK ────────────────────
-function geocodeWithFallback(queries, optHeaders, callback, initialCount = null) {
-    if (initialCount === null) initialCount = queries.length;
-    const [current, ...rest] = queries;
-    if (!current) return callback(null, null, null, initialCount); // all exhausted
-
-    // Force appending Tamil Nadu if it's not present
-    const qWithState = current.toLowerCase().includes('tamil nadu') ? current : current + ' Tamil Nadu';
-    const encoded = encodeURIComponent(qWithState);
-    const url = `https://nominatim.openstreetmap.org/search?q=${encoded}&format=json&limit=1&countrycodes=in`;
-    https.get(url, optHeaders, (geoRes) => {
-        let raw = '';
-        geoRes.on('data', c => raw += c);
-        geoRes.on('end', () => {
-            let data;
-            try { data = JSON.parse(raw); } catch (e) { data = []; }
-            
-            // Check if it's in TN (if data exists)
-            let validResult = null;
-            if (data && data.length > 0) {
-                 if (data[0].display_name.toLowerCase().includes('tamil nadu')) {
-                     validResult = data[0];
-                 }
-            }
-
-            if (validResult) {
-                // Success — level is calculated against the total number of starting queries
-                const fallbackLevel = initialCount - rest.length - 1;
-                callback(null, validResult, current, fallbackLevel);
-            } else if (rest.length > 0) {
-                // Try next fallback
-                geocodeWithFallback(rest, optHeaders, callback, initialCount);
-            } else {
-                callback(null, null, null, initialCount);
-            }
-        });
-    }).on('error', err => callback(err));
+function cleanAddress(addr) {
+    if (!addr) return '';
+    let cleaned = addr.toLowerCase();
+    cleaned = cleaned.replace(/[0-9]/g, ''); // Remove numbers
+    // Fix spelling mistakes
+    const fixes = {
+        'coimbtore': 'coimbatore',
+        'polachi': 'pollachi',
+        'chenai': 'chennai',
+        'maduraii': 'madurai',
+        'tiruchi': 'tiruchirappalli',
+        'trichy': 'tiruchirappalli'
+    };
+    Object.keys(fixes).forEach(key => {
+        cleaned = cleaned.replace(new RegExp(key, 'g'), fixes[key]);
+    });
+    return cleaned.trim();
 }
 
-// ─── AUTOCOMPLETE SUGGESTIONS endpoint ───────────────────────
-app.get('/api/public/autocomplete', (req, res) => {
-    const { q } = req.query;
-    if (!q || q.length < 2) return res.json([]);
+const geocodeCache = {};
+async function geocodeWithFallback(q) {
+    if (!q) return null;
+    const cleaned = cleanAddress(q);
+    
+    // Fallback steps
+    const parts = cleaned.split(',').map(p => p.trim()).filter(p => p);
+    const fallbacks = [
+        cleaned, // 1. Full address
+        parts.slice(1).join(', '), // 2. Remove first part (street)
+        parts.length > 2 ? parts[parts.length - 2] + ', ' + parts[parts.length - 1] : null, // 3. Village + Taluk (approx)
+        parts[parts.length - 1], // 4. Last part (District/City)
+        'Tamil Nadu' // 5. Ultimate fallback
+    ].filter(f => f);
 
-    // Step 1: Search local TN Villages dataset
-    const localQuery = `
-        SELECT village_en, taluk_en, district_en 
-        FROM tn_villages 
-        WHERE village_en LIKE ? OR district_en LIKE ? 
-        LIMIT 10
+    for (let query of fallbacks) {
+        const fullQuery = query.includes('Tamil Nadu') ? query + ', India' : query + ', Tamil Nadu, India';
+        if (geocodeCache[fullQuery]) return geocodeCache[fullQuery];
+
+        const result = await new Promise(resolve => {
+            const encoded = encodeURIComponent(fullQuery);
+            const url = `https://nominatim.openstreetmap.org/search?q=${encoded}&format=json&limit=1&countrycodes=in`;
+            https.get(url, { headers: { 'User-Agent': 'SmartCityWaterSystem/2.0' } }, (res) => {
+                let raw = '';
+                res.on('data', c => raw += c);
+                res.on('end', () => {
+                    try {
+                        const data = JSON.parse(raw);
+                        if (data && data.length > 0) {
+                            const resObj = { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon), display_name: data[0].display_name };
+                            geocodeCache[fullQuery] = resObj;
+                            return resolve(resObj);
+                        }
+                    } catch (e) {}
+                    resolve(null);
+                });
+            }).on('error', () => resolve(null));
+        });
+        if (result) return result;
+    }
+    return null;
+}
+
+app.post('/api/public/check-water', async (req, res) => {
+    const { q, area_id, date } = req.body;
+
+    let userLat, userLon, displayName;
+    let isFallback = false;
+
+    // Handle Geocoding Search OR Direct Area Selection
+    if (area_id) {
+        const area = await new Promise(r => db.get("SELECT name, latitude, longitude FROM areas WHERE id = ?", [area_id], (err, row) => r(row)));
+        if (!area) return res.status(404).json({ error: 'Area not found.' });
+        userLat = area.latitude;
+        userLon = area.longitude;
+        displayName = area.name;
+    } else if (q) {
+        const geoResult = await geocodeWithFallback(q);
+        if (!geoResult) return res.status(404).json({ error: 'Location not found in Tamil Nadu.' });
+        userLat = geoResult.lat;
+        userLon = geoResult.lon;
+        displayName = geoResult.display_name;
+        // Check if it's a fallback (crude check)
+        if (!displayName.toLowerCase().includes(cleanAddress(q).split(',')[0])) {
+            isFallback = true;
+        }
+    } else {
+        return res.status(400).json({ error: 'Query or Area ID required.' });
+    }
+
+    // Step 2: Spatial Query with Bounding Box (150km approx ~ 1.35 degrees)
+    const latOffset = 1.35;
+    const lonOffset = 1.35;
+    const query = `
+        SELECT t.id as tank_id, t.name as tank_name, t.type, t.latitude, t.longitude, t.area_id,
+               a.name as area_name, tl.name as taluk_name, d.name as district_name
+        FROM water_tanks t
+        JOIN areas a ON t.area_id = a.id
+        JOIN taluks tl ON a.taluk_id = tl.id
+        JOIN districts d ON tl.district_id = d.id
+        WHERE t.latitude BETWEEN ? AND ? AND t.longitude BETWEEN ? AND ?
     `;
-    const searchTerm = `%${q}%`;
 
-    db.all(localQuery, [searchTerm, searchTerm], (err, localRows) => {
-        const localSuggestions = (localRows || []).map(r => ({
-            display: `${r.village_en}, ${r.taluk_en}, ${r.district_en}`,
-            full: `${r.village_en}, ${r.taluk_en}, ${r.district_en}, Tamil Nadu`,
-            type: 'local'
-        }));
+    db.all(query, [userLat - latOffset, userLat + latOffset, userLon - lonOffset, userLon + lonOffset], async (dbErr, tanks) => {
+        if (dbErr) return res.status(500).json({ error: dbErr.message });
+        
+        let targetTanks = tanks;
+        let warningMessage = isFallback ? "Exact address not found, showing nearest known location." : null;
 
-        // Step 2: Fallback to Nominatim if local results are few
-        if (localSuggestions.length >= 5) {
-            return res.json(localSuggestions);
+        if (!tanks || tanks.length === 0) {
+           // If no tanks in bbox, use the nearest available source from entire DB
+           warningMessage = "Using nearest available water source outside search radius.";
+           targetTanks = await new Promise(r => db.all("SELECT t.id as tank_id, t.name as tank_name, t.type, t.latitude, t.longitude, t.area_id, a.name as area_name FROM water_tanks t JOIN areas a ON t.area_id = a.id", (e, rows) => r(rows || [])));
         }
 
-        const encoded = encodeURIComponent(q + ' Tamil Nadu');
-        const url = `https://nominatim.openstreetmap.org/search?q=${encoded}&format=json&limit=5&countrycodes=in`;
-        const opts = { headers: { 'User-Agent': 'WaterMonitorApp/1.0' } };
+        if (!targetTanks || targetTanks.length === 0) {
+            return res.status(404).json({ error: 'No water tanks found in system.' });
+        }
 
-        https.get(url, opts, (geoRes) => {
-            let raw = '';
-            geoRes.on('data', c => raw += c);
-            geoRes.on('end', () => {
-                let data;
-                try { data = JSON.parse(raw); } catch (e) { return res.json(localSuggestions); }
-                const remoteSuggestions = (data || [])
-                    .filter(r => r.display_name.toLowerCase().includes('tamil nadu'))
-                    .map(r => ({
-                        display: r.display_name.split(',').slice(0, 3).join(',').trim(),
-                        full: r.display_name,
-                        type: 'remote'
-                    }));
-                // Combine and deduplicate if necessary (for now just combine)
-                res.json([...localSuggestions, ...remoteSuggestions].slice(0, 10));
+        // Calculate Haversine Distances & Rank Top 3
+        targetTanks.forEach(t => t.distance = haversine(userLat, userLon, t.latitude, t.longitude));
+        targetTanks.sort((a, b) => a.distance - b.distance);
+        const top3Tanks = targetTanks.slice(0, 3);
+
+        // Fetch Temporal Data
+        const targetDate = date || new Date().toISOString().split('T')[0];
+        
+        for (let tank of top3Tanks) {
+            // Find reading for specific date OR latest
+            const readings = await new Promise(r => {
+                const sql = `
+                    SELECT * FROM water_quality 
+                    WHERE tank_id = ? 
+                    ORDER BY ABS(JULIANDAY(date) - JULIANDAY(?)) ASC 
+                    LIMIT 3
+                `;
+                db.all(sql, [tank.tank_id, targetDate], (e, rows) => r(rows || []));
             });
-        }).on('error', () => res.json(localSuggestions));
-    });
-});
+            
+            tank.latest = readings.length > 0 ? readings[0] : { ph: 7.0, turbidity: 2.0, status: 'Safe' };
+            tank.date = tank.latest.date;
+            
+            // AI DECISION ENGINE
+            const ph = tank.latest.ph;
+            const turbidity = tank.latest.turbidity;
+            if (ph < 6.5) {
+                tank.latest.status = "Unsafe";
+                tank.aiExplanation = "Unsafe due to low pH (acidic).";
+            } else if (turbidity > 5) {
+                tank.latest.status = "Unsafe";
+                tank.aiExplanation = "Unsafe due to high turbidity.";
+            } else {
+                tank.latest.status = "Safe";
+                tank.aiExplanation = "Water is safe for drinking.";
+            }
+        }
 
-// ─── ADDRESS + DATE SEARCH → NEAREST AREA → TANK QUALITY ────
-app.get('/api/public/search-address', (req, res) => {
-    const { q, date } = req.query;
-    if (!q) return res.status(400).json({ error: 'Query parameter q is required.' });
-    if (!date) return res.status(400).json({ error: 'Query parameter date is required.' });
+        const selectedTank = top3Tanks[0];
 
-    // Build fallback query chain from the cleaned address
-    const parts = q.split(' ').filter(Boolean);
-    const fallbackQueries = [
-        q,                                                    // Full: "27 Chellammal Nagar Bharathi Street Coimbatore"
-        parts.slice(-3).join(' '),                           // Last 3 words: "Bharathi Street Coimbatore"
-        parts.slice(-2).join(' '),                           // Last 2 words: "Street Coimbatore"
-        'Coimbatore Tamil Nadu'                              // City fallback
-    ].filter((v, i, arr) => arr.indexOf(v) === i);          // deduplicate
-
-    const opts = { headers: { 'User-Agent': 'WaterMonitorApp/1.0' } };
-
-    geocodeWithFallback(fallbackQueries, opts, (err, geoResult, usedQuery, fallbackLevel) => {
-        if (err) return res.status(500).json({ error: 'Geocoding network error: ' + err.message });
-        if (!geoResult) return res.status(404).json({ error: 'Address not found even after fallback. Try: "RS Puram Coimbatore".' });
-
-        const userLat = parseFloat(geoResult.lat);
-        const userLon = parseFloat(geoResult.lon);
-        const displayName = geoResult.display_name;
-        const usedFallback = fallbackLevel > 0;
-
-        db.all(`
-            SELECT a.id as area_id, a.name as area_name, a.latitude, a.longitude, a.tank_id,
-                   t.name as tank_name
-            FROM areas a JOIN tanks t ON t.id = a.tank_id ORDER BY a.name
-        `, (dbErr, areas) => {
-            if (dbErr) return res.status(500).json({ error: dbErr.message });
-
-            const withDist = areas.map(area => ({
-                ...area,
-                distance_km: haversine(userLat, userLon, area.latitude, area.longitude)
-            }));
-            withDist.sort((a, b) => a.distance_km - b.distance_km);
-            const nearest = withDist[0];
-
-            db.get(`
-                SELECT * FROM water_readings
-                WHERE tank_id = ? AND date = ?
-                ORDER BY created_at DESC LIMIT 1
-            `, [nearest.tank_id, date], (err, reading) => {
-                if (err) return res.status(500).json({ error: err.message });
-                res.json({
-                    user_lat: userLat,
-                    user_lon: userLon,
-                    display_name: displayName,
-                    used_query: usedQuery,
-                    used_fallback: usedFallback,
-                    fallback_level: fallbackLevel,
-                    nearest_area: {
-                        ...nearest,
-                        ...(reading || {}),
-                        prediction: reading ? reading.prediction : null
-                    },
-                    distance_km: nearest.distance_km.toFixed(2),
-                    reading_date: date,
-                    has_data: !!reading
-                });
-            });
+        res.json({
+            resolved_location: displayName,
+            warning: warningMessage,
+            user: { lat: userLat, lon: userLon, address: displayName },
+            tank: selectedTank.tank_name,
+            distance_km: parseFloat(selectedTank.distance.toFixed(2)),
+            date: selectedTank.date,
+            status: selectedTank.latest.status,
+            ph: selectedTank.latest.ph,
+            turbidity: selectedTank.latest.turbidity,
+            message: selectedTank.aiExplanation,
+            selectedTank: {
+                id: selectedTank.tank_id,
+                name: selectedTank.tank_name,
+                type: selectedTank.type,
+                area: selectedTank.area_name,
+                lat: selectedTank.latitude,
+                lon: selectedTank.longitude,
+                distance_km: selectedTank.distance.toFixed(2),
+                quality: selectedTank.latest,
+                explanation: selectedTank.aiExplanation
+            },
+            alternatives: top3Tanks.slice(1).map(t => ({
+                id: t.tank_id, 
+                name: t.tank_name, 
+                distance_km: t.distance.toFixed(2), 
+                status: t.latest.status, 
+                latitude: t.latitude, 
+                longitude: t.longitude,
+                explanation: t.aiExplanation
+            }))
         });
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`Dual-Portal Server running on http://localhost:${PORT}`);
+    console.log(`Smart-City Water API running on http://localhost:${PORT}`);
 });

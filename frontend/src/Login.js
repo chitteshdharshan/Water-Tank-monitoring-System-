@@ -29,33 +29,34 @@ function Login() {
     };
 
     return (
-        <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4 relative overflow-hidden font-sans">
-            {/* Background glowing orbs */}
-            <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-cyan-500/20 rounded-full blur-[120px] pointer-events-none"></div>
-            <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-emerald-500/10 rounded-full blur-[120px] pointer-events-none"></div>
+        <div className="min-h-screen bg-white flex items-center justify-center p-4 relative overflow-hidden font-sans">
+            {/* Background subtle gradients */}
+            <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_20%_20%,rgba(37,99,235,0.05),transparent_50%)]"></div>
+            <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-blue-400/10 rounded-full blur-[120px] pointer-events-none"></div>
+            <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-emerald-400/5 rounded-full blur-[120px] pointer-events-none"></div>
 
-            <div className="bg-slate-800/60 backdrop-blur-xl border border-slate-700/50 p-8 md:p-10 rounded-3xl shadow-2xl w-full max-w-md relative z-10">
+            <div className="bg-white/70 backdrop-blur-2xl border border-slate-200 p-8 md:p-10 rounded-[3rem] shadow-[0_32px_64px_-16px_rgba(0,0,0,0.1)] w-full max-w-md relative z-10">
                 <div className="text-center mb-10">
-                    <span className="text-4xl mb-4 block drop-shadow-[0_0_15px_rgba(34,211,238,0.5)]">🔐</span>
-                    <h2 className="text-2xl md:text-3xl font-bold bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent">
-                        Official Control Panel
+                    <span className="text-5xl mb-6 block">🔐</span>
+                    <h2 className="text-3xl font-black text-slate-800 tracking-tight leading-tight">
+                        Official Access
                     </h2>
-                    <p className="text-slate-400 mt-2 text-sm">Sign in to access sensor arrays.</p>
+                    <p className="text-slate-500 mt-2 text-sm font-medium">Authorized Personnel Entry Only</p>
                 </div>
 
                 {error && (
-                    <div className="bg-rose-500/10 border border-rose-500/30 text-rose-400 px-4 py-3 rounded-xl text-center text-sm font-medium mb-6 animate-pulse">
+                    <div className="bg-rose-50 border border-rose-100 text-rose-600 px-4 py-3 rounded-2xl text-center text-sm font-bold mb-6">
                         {error}
                     </div>
                 )}
 
                 <form onSubmit={handleSubmit} className="space-y-6">
                     <div className="flex flex-col gap-2">
-                        <label className="text-xs font-semibold text-slate-400 uppercase tracking-widest pl-1">Authorized Username</label>
+                        <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] pl-1">Authorized Username</label>
                         <input 
                             type="text" 
-                            className="bg-slate-900/50 border border-slate-700 focus:border-cyan-500/50 focus:ring-2 focus:ring-cyan-500/20 text-slate-200 rounded-xl px-4 py-3 outline-none transition-all"
-                            placeholder="Enter username"
+                            className="bg-slate-50 border border-slate-200 focus:border-blue-500 focus:ring-4 focus:ring-blue-500/10 text-slate-800 rounded-2xl px-5 py-4 outline-none transition-all font-bold placeholder:font-normal placeholder:text-slate-300"
+                            placeholder="e.g. admin_hq"
                             value={credentials.username}
                             onChange={(e) => setCredentials({...credentials, username: e.target.value})}
                             required 
@@ -63,10 +64,10 @@ function Login() {
                     </div>
                     
                     <div className="flex flex-col gap-2">
-                        <label className="text-xs font-semibold text-slate-400 uppercase tracking-widest pl-1">Secure Password</label>
+                        <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] pl-1">Secure Password</label>
                         <input 
                             type="password" 
-                            className="bg-slate-900/50 border border-slate-700 focus:border-cyan-500/50 focus:ring-2 focus:ring-cyan-500/20 text-slate-200 rounded-xl px-4 py-3 outline-none transition-all font-mono"
+                            className="bg-slate-50 border border-slate-200 focus:border-blue-500 focus:ring-4 focus:ring-blue-500/10 text-slate-800 rounded-2xl px-5 py-4 outline-none transition-all font-mono tracking-widest"
                             placeholder="••••••••"
                             value={credentials.password}
                             onChange={(e) => setCredentials({...credentials, password: e.target.value})}
@@ -74,18 +75,16 @@ function Login() {
                         />
                     </div>
 
-                    <button type="submit" className="w-full bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-400 hover:to-blue-400 text-slate-900 font-bold px-4 py-3.5 rounded-xl transition-all shadow-lg shadow-cyan-500/20 hover:scale-[1.02] active:scale-[0.98]">
+                    <button type="submit" className="w-full bg-slate-900 hover:bg-slate-800 text-white font-black px-4 py-4.5 rounded-2xl transition-all shadow-xl shadow-slate-900/10 hover:scale-[1.02] active:scale-[0.98] mt-4">
                         Establish Connection
                     </button>
                 </form>
 
-                <div className="mt-8 text-center border-t border-slate-700/50 pt-6">
-                    <button 
-                        className="text-slate-400 hover:text-cyan-400 text-sm font-medium transition-colors border border-transparent hover:border-cyan-500/30 bg-slate-800/50 hover:bg-slate-800 px-4 py-2 rounded-lg"
-                        onClick={() => navigate('/')}
-                    >
-                        ← Return to Public Map
-                    </button>
+                <div className="mt-12 text-center">
+                    <p className="text-[10px] font-black uppercase tracking-[0.4em] text-slate-300 mb-6">Secured Environment v4.2.0</p>
+                    <div className="flex justify-center gap-2">
+                        {[1,2,3].map(i => <div key={i} className="w-1 h-1 rounded-full bg-slate-200"></div>)}
+                    </div>
                 </div>
             </div>
         </div>
