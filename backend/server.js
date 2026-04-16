@@ -181,17 +181,33 @@ async function geocodeWithFallback(q) {
     if (!q) return null;
     const cleaned = cleanAddress(q);
     
+    const wordsRaw = cleaned.split(' ').filter(w => w);
+    if (wordsRaw.length > 1 && new Set(wordsRaw).size === 1) {
+        return null; // Reject dummy repeats like "hello hello hello"
+    }
+    
     // Fallback steps
     const parts = cleaned.split(',').map(p => p.trim()).filter(p => p);
     const fallbacks = [
         cleaned, // 1. Full address
         parts.slice(1).join(', '), // 2. Remove first part (street)
         parts.length > 2 ? parts[parts.length - 2] + ', ' + parts[parts.length - 1] : null, // 3. Village + Taluk (approx)
-        parts[parts.length - 1], // 4. Last part (District/City)
-        'Tamil Nadu' // 5. Ultimate fallback
-    ].filter(f => f);
+        parts[parts.length - 1] // 4. Last part (District/City)
+    ];
 
-    for (let query of fallbacks) {
+    // If the user didn't use commas, add word-level fallbacks to find the broader city
+    if (cleaned.includes(' ')) {
+        const words = cleaned.split(' ').filter(w => w);
+        if (words.length > 2) {
+            fallbacks.push(words.slice(1).join(' ')); // Drop first word
+            fallbacks.push(words.slice(-2).join(' ')); // Last two words (e.g. area city)
+            fallbacks.push(words[words.length - 1]); // Last word (e.g. city)
+        }
+    }
+
+    const uniqueFallbacks = [...new Set(fallbacks.filter(f => f && f.trim().length > 2))];
+
+    for (let query of uniqueFallbacks) {
         const fullQuery = query.includes('Tamil Nadu') ? query + ', India' : query + ', Tamil Nadu, India';
         if (geocodeCache[fullQuery]) return geocodeCache[fullQuery];
 
@@ -219,6 +235,28 @@ async function geocodeWithFallback(q) {
     return null;
 }
 
+app.post('/api/public/validate-location', async (req, res) => {
+    const { q } = req.body;
+    if (!q) return res.status(400).json({ error: 'Query required.' });
+    
+    // Try local DB first
+    const localMatch = await new Promise(r => {
+        db.get(`
+            SELECT t.name as tank_name, a.name as area_name 
+            FROM water_tanks t 
+            JOIN areas a ON t.area_id = a.id 
+            WHERE t.name LIKE ? OR a.name LIKE ? LIMIT 1
+        `, [`%${q.trim()}%`, `%${q.trim()}%`], (err, row) => r(row));
+    });
+
+    if (localMatch) return res.json({ valid: true, resolved: localMatch.tank_name + ', ' + localMatch.area_name });
+
+    const geoResult = await geocodeWithFallback(q);
+    if (!geoResult) return res.status(404).json({ error: 'Location not found.' });
+    
+    res.json({ valid: true, resolved: geoResult.display_name });
+});
+
 app.post('/api/public/check-water', async (req, res) => {
     const { q, area_id, date } = req.body;
 
@@ -233,14 +271,30 @@ app.post('/api/public/check-water', async (req, res) => {
         userLon = area.longitude;
         displayName = area.name;
     } else if (q) {
-        const geoResult = await geocodeWithFallback(q);
-        if (!geoResult) return res.status(404).json({ error: 'Location not found in Tamil Nadu.' });
-        userLat = geoResult.lat;
-        userLon = geoResult.lon;
-        displayName = geoResult.display_name;
-        // Check if it's a fallback (crude check)
-        if (!displayName.toLowerCase().includes(cleanAddress(q).split(',')[0])) {
-            isFallback = true;
+        // Try local DB search first for Tank Name or Area Name
+        const localMatch = await new Promise(r => {
+            db.get(`
+                SELECT t.name as tank_name, a.name as area_name, t.latitude, t.longitude 
+                FROM water_tanks t 
+                JOIN areas a ON t.area_id = a.id 
+                WHERE t.name LIKE ? OR a.name LIKE ? LIMIT 1
+            `, [`%${q.trim()}%`, `%${q.trim()}%`], (err, row) => r(row));
+        });
+
+        if (localMatch) {
+            userLat = localMatch.latitude;
+            userLon = localMatch.longitude;
+            displayName = localMatch.tank_name + ', ' + localMatch.area_name;
+        } else {
+            const geoResult = await geocodeWithFallback(q);
+            if (!geoResult) return res.status(404).json({ error: 'Location not found in Tamil Nadu.' });
+            userLat = geoResult.lat;
+            userLon = geoResult.lon;
+            displayName = geoResult.display_name;
+            // Check if it's a fallback (crude check)
+            if (!displayName.toLowerCase().includes(cleanAddress(q).split(',')[0])) {
+                isFallback = true;
+            }
         }
     } else {
         return res.status(400).json({ error: 'Query or Area ID required.' });
@@ -284,36 +338,49 @@ app.post('/api/public/check-water', async (req, res) => {
         const targetDate = date || new Date().toISOString().split('T')[0];
         
         for (let tank of top3Tanks) {
-            // Find reading for specific date OR latest
+            // Find reading for specific date
             const readings = await new Promise(r => {
                 const sql = `
                     SELECT * FROM water_quality 
-                    WHERE tank_id = ? 
-                    ORDER BY ABS(JULIANDAY(date) - JULIANDAY(?)) ASC 
-                    LIMIT 3
+                    WHERE tank_id = ? AND date <= ?
+                    ORDER BY date DESC
+                    LIMIT 1
                 `;
                 db.all(sql, [tank.tank_id, targetDate], (e, rows) => r(rows || []));
             });
             
-            tank.latest = readings.length > 0 ? readings[0] : { ph: 7.0, turbidity: 2.0, status: 'Safe' };
-            tank.date = tank.latest.date;
-            
-            // AI DECISION ENGINE
-            const ph = tank.latest.ph;
-            const turbidity = tank.latest.turbidity;
-            if (ph < 6.5) {
-                tank.latest.status = "Unsafe";
-                tank.aiExplanation = "Unsafe due to low pH (acidic).";
-            } else if (turbidity > 5) {
-                tank.latest.status = "Unsafe";
-                tank.aiExplanation = "Unsafe due to high turbidity.";
+            if (readings.length > 0) {
+                tank.latest = readings[0];
+                tank.date = tank.latest.date;
+                
+                // AI DECISION ENGINE
+                const ph = tank.latest.ph;
+                const turbidity = tank.latest.turbidity;
+                if (ph < 6.5) {
+                    tank.latest.status = "Unsafe";
+                    tank.aiExplanation = "Unsafe due to low pH (acidic).";
+                } else if (turbidity > 5) {
+                    tank.latest.status = "Unsafe";
+                    tank.aiExplanation = "Unsafe due to high turbidity.";
+                } else {
+                    tank.latest.status = "Safe";
+                    tank.aiExplanation = "Water is safe for drinking.";
+                }
             } else {
-                tank.latest.status = "Safe";
-                tank.aiExplanation = "Water is safe for drinking.";
+                tank.latest = null;
             }
         }
 
-        const selectedTank = top3Tanks[0];
+        const tanksWithData = top3Tanks.filter(t => t.latest !== null);
+
+        // Filter out tanks whose data is older than targetDate, meaning out of date
+        const validTanks = tanksWithData.filter(t => t.latest.date === targetDate);
+
+        if (validTanks.length === 0) {
+            return res.status(404).json({ error: 'Out of date' });
+        }
+
+        const selectedTank = validTanks[0];
 
         res.json({
             resolved_location: displayName,
@@ -337,7 +404,7 @@ app.post('/api/public/check-water', async (req, res) => {
                 quality: selectedTank.latest,
                 explanation: selectedTank.aiExplanation
             },
-            alternatives: top3Tanks.slice(1).map(t => ({
+            alternatives: validTanks.slice(1).map(t => ({
                 id: t.tank_id, 
                 name: t.tank_name, 
                 distance_km: t.distance.toFixed(2), 

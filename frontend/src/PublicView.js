@@ -73,6 +73,8 @@ export default function PublicView() {
     const [error, setError] = useState(null);
     const [isSpeaking, setIsSpeaking] = useState(false);
     const [isListening, setIsListening] = useState(false);
+    const [recognitionLang, setRecognitionLang] = useState('ta-IN'); // Default to Tamil
+    const [isTranslating, setIsTranslating] = useState(false);
 
     useEffect(() => {
         fetch('http://localhost:5001/api/public/districts')
@@ -103,21 +105,99 @@ export default function PublicView() {
         window.speechSynthesis.speak(utterance);
     };
 
+    const translateText = async (text, target = 'en') => {
+        if (!text || recognitionLang === 'en-US') return text;
+        setIsTranslating(true);
+        try {
+            const res = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${target}&dt=t&q=${encodeURIComponent(text)}`);
+            const data = await res.json();
+            return data[0][0][0];
+        } catch (e) {
+            console.error("Translation error:", e);
+            return text;
+        } finally {
+            setIsTranslating(false);
+        }
+    };
+
     const startListening = () => {
-        if (!('webkitSpeechRecognition' in window)) return;
-        const recognition = new window.webkitSpeechRecognition();
-        recognition.onstart = () => setIsListening(true);
-        recognition.onresult = (event) => {
-            const transcript = event.results[0][0].transcript;
-            setSearchQuery(transcript);
-            runEngine({ q: transcript });
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            setError("Speech recognition is not supported in this browser. Please use Chrome or Safari.");
+            return;
+        }
+
+        const recognition = new SpeechRecognition();
+        recognition.lang = recognitionLang;
+        recognition.interimResults = false;
+        recognition.maxAlternatives = 1;
+
+        recognition.onstart = () => {
+            setIsListening(true);
+            setError(null);
         };
-        recognition.onend = () => setIsListening(false);
-        recognition.start();
+
+        recognition.onresult = async (event) => {
+            let transcript = event.results[0][0].transcript;
+            
+            // Basic Address Validation: Check if it's too short or just numbers/gibberish
+            if (transcript.length < 3 || /^\d+$/.test(transcript)) {
+                setError("Please speak a valid address or village name.");
+                return;
+            }
+
+            // Translate if it's not English
+            if (recognitionLang !== 'en-US') {
+                const translated = await translateText(transcript);
+                transcript = translated;
+            }
+
+            // Validation step: Only accept if the location is valid
+            try {
+                setIsTranslating(true); // Re-use loading state
+                const res = await fetch('http://localhost:5001/api/public/validate-location', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ q: transcript })
+                });
+                setIsTranslating(false);
+                
+                if (res.ok) {
+                    setSearchQuery(transcript);
+                } else {
+                    setError(`Voice Error: "${transcript}" is not recognized as a valid address. Please try speaking again.`);
+                }
+            } catch (e) {
+                setIsTranslating(false);
+                setError(`Validation error: ${e.message}`);
+            }
+            // Removed runEngine auto-trigger as per user request to wait for 'Analyze Supply'
+        };
+
+        recognition.onerror = (event) => {
+            console.error("Speech recognition error:", event.error);
+            if (event.error === 'not-allowed') {
+                setError("Microphone access denied. Please enable it in browser settings.");
+            } else {
+                setError(`Microphone error: ${event.error}`);
+            }
+            setIsListening(false);
+        };
+
+        recognition.onend = () => {
+            setIsListening(false);
+        };
+
+        try {
+            recognition.start();
+        } catch (e) {
+            setError("Failed to start voice recognition.");
+            setIsListening(false);
+        }
     };
 
     const runEngine = async (payload) => {
-        setLoading(true); setError(null);
+        setLoading(true); setError(null); setResult(null);
         try {
             const res = await fetch(`http://localhost:5001/api/public/check-water`, {
                 method: 'POST',
@@ -154,10 +234,15 @@ export default function PublicView() {
                                 <div className="space-y-2">
                                     <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Address Match</label>
                                     <div className="relative group">
-                                        <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="Type village or street..." className="input-field pr-16" />
-                                        <button type="button" onClick={startListening} className={`absolute right-4 top-1/2 -translate-y-1/2 p-2 rounded-lg transition-colors ${isListening ? 'bg-rose-500 text-white animate-pulse' : 'text-slate-400 hover:bg-slate-50'}`}>
-                                            <Mic className="w-4 h-4" />
-                                        </button>
+                                        <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder={recognitionLang === 'ta-IN' ? "வூர் அல்லது தெரு..." : "Type village or street..."} className="input-field pr-24" />
+                                        <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                                            <button type="button" onClick={() => setRecognitionLang(prev => prev === 'ta-IN' ? 'en-US' : 'ta-IN')} className="text-[9px] font-black px-1.5 py-1 rounded bg-slate-100 text-slate-500 hover:bg-blue-600 hover:text-white transition-all uppercase tracking-tighter">
+                                                {recognitionLang === 'ta-IN' ? 'TA' : 'EN'}
+                                            </button>
+                                            <button type="button" onClick={startListening} className={`p-2 rounded-lg transition-all ${isListening ? 'bg-rose-500 text-white animate-pulse' : isTranslating ? 'bg-blue-500 text-white animate-spin' : 'text-slate-400 hover:bg-slate-50'}`}>
+                                                {isTranslating ? <Loader2 className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
                                 <div className="space-y-2">
